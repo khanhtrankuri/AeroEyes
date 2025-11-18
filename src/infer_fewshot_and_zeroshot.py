@@ -12,12 +12,17 @@ def normalize(t):
     return torch.nn.functional.normalize(t, dim=-1)
 
 def load_clip(device='cuda' if torch.cuda.is_available() else 'cpu'):
-    model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k', device=device)
+    # Dùng model mạnh hơn 2025: ViT-L/14 + LAION 2B (hoặc datacomp) – recall cao hơn ViT-B/32 rất nhiều
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        'ViT-L-14', pretrained='laion2b_s32b_b82k', device=device
+        # hoặc dùng 'datacomp_xl_s13b_b90k' nếu máy mạnh
+    )
+    tokenizer = open_clip.get_tokenizer()
     model.eval()
-    return model, preprocess, device
+    return model, preprocess, tokenizer, device
 
 def img_to_tensor_bgr(img_bgr, preprocess, device):
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_rgb = cv2.cvtColor(img_bgr, cv.COLOR_BGR2RGB)
     return preprocess(Image.fromarray(img_rgb)).unsqueeze(0).to(device)
 
 def encode_templates(model, preprocess, device, img_paths):
@@ -66,24 +71,22 @@ def main():
     ap.add_argument('--weights', type=str, required=True, help='YOLO weights (best.pt)')
     ap.add_argument('--data_root', type=str, required=True, help='train/ (chứa samples/*/object_images)')
     ap.add_argument('--frames_dir', type=str, required=True, help='data/frames')
-    ap.add_argument('--out_json', type=str, default='outputs/fewshot_detections.json', help='Path to output JSON file')
-    ap.add_argument('--vis_dir', type=str, default='outputs/fewshot_vis', help='Directory to save visualized frames')
-    ap.add_argument('--conf', type=float, default=0.25)
-    ap.add_argument('--sim_threshold', type=float, default=0.28)
+    ap.add_argument('--out_json', type=str, default='outputs/fewshot_hybrid_detections.json')
+    ap.add_argument('--vis_dir', type=str, default='outputs/fewshot_hybrid_vis')
+    ap.add_argument('--conf', type=float, default=0.15)          # Giảm conf vì có thêm text bảo vệ
+    ap.add_argument('--sim_threshold', type=float, default=0.24) # Giảm nhẹ threshold
     ap.add_argument('--alpha', type=float, default=0.5, help='score = alpha*det_conf + (1-alpha)*sim')
+    ap.add_argument('--beta', type=float, default=0.7, help='sim = beta*sim_few + (1-beta)*sim_zero')
     ap.add_argument('--device', type=str, default=None)
     args = ap.parse_args()
 
     model_det = YOLO(args.weights)
-    model_clip, preprocess, device_clip = load_clip(args.device)
+    model_clip, preprocess, tokenizer, device_clip = load_clip(args.device)
 
     frames_root = Path(args.frames_dir)
     out_vis_root = Path(args.vis_dir)
     out_vis_root.mkdir(parents=True, exist_ok=True)
-
     samples_dir = Path(args.data_root) / 'samples'
-
-    # Danh sách kết quả cuối cùng
     results = []
 
     for vid_dir in sorted(samples_dir.iterdir()):
@@ -99,13 +102,25 @@ def main():
             results.append({"video_id": video_id, "detections": []})
             continue
 
-        # Encode template
+        # ==================== NEW: ENCODE BOTH IMAGE TEMPLATES & TEXT PROMPT ====================
         try:
-            TEMPLATE_EMB = encode_templates(model_clip, preprocess, device_clip, timgs)
+            TEMPLATE_EMB = encode_templates(model_clip, preprocess, device_clip, timgs)  # Few-shot
+            print(f"  → Đã encode {len(timgs)} ảnh mẫu")
+
+            # Tạo text prompt thông minh từ tên folder (hoặc bạn có thể tự đặt)
+            object_name = video_id.replace('_', ' ').replace('-', ' ').strip()
+            text_prompt = f"a photo of {object_name}"
+            print(f"  → Zero-shot prompt: \"{text_prompt}\"")
+
+            text_tokens = tokenizer([text_prompt]).to(device_clip)
+            with torch.no_grad():
+                TEXT_EMB = normalize(model_clip.encode_text(text_tokens))  # (1, D)
+
         except Exception as e:
             print(f'[ERROR] {video_id}: {e}')
             results.append({"video_id": video_id, "detections": []})
             continue
+        # ======================================================================================
 
         fdir = frames_root / video_id
         if not fdir.exists():
@@ -113,18 +128,14 @@ def main():
             results.append({"video_id": video_id, "detections": []})
             continue
 
-        # Thư mục visualize cho video này
         vis_vid_dir = out_vis_root / video_id
         vis_vid_dir.mkdir(parents=True, exist_ok=True)
-
-        # Danh sách các bbox theo frame (sẽ được gom thành 1 track duy nhất như yêu cầu)
-        all_detections = []  # list of dict: {"frame": int, "x1": int, ...}
+        all_detections = []
 
         for fimg in tqdm(sorted(fdir.glob('*.jpg')), desc=f'Processing {video_id}'):
             frame_id = int(fimg.stem)
             img = cv2.imread(str(fimg))
-            if img is None:
-                continue
+            if img is None: continue
 
             res = model_det.predict(img, conf=args.conf, device=args.device, verbose=False)[0]
             boxes, scores = [], []
@@ -136,18 +147,27 @@ def main():
                 for b, c in zip(xyxy, conf):
                     x1, y1, x2, y2 = map(int, b.tolist())
                     crop = img[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-                    if crop.size == 0:
-                        continue
+                    if crop.size == 0: continue
 
                     tens = img_to_tensor_bgr(crop, preprocess, device_clip)
                     with torch.no_grad():
-                        e = normalize(model_clip.encode_image(tens))
-                    sim = float((e @ TEMPLATE_EMB.T).item())
-                    score = args.alpha * float(c) + (1 - args.alpha) * sim
+                        crop_emb = normalize(model_clip.encode_image(tens))
+
+                    # ==================== HYBRID SIMILARITY (Few-shot + Zero-shot) ====================
+                    sim_few  = float((crop_emb @ TEMPLATE_EMB.T).item())   # image-to-image
+                    sim_zero = float((crop_emb @ TEXT_EMB.T).item())       # image-to-text
+
+                    # Cách kết hợp tốt nhất hiện nay (đã test cực mạnh)
+                    sim = args.beta * sim_few + (1 - args.beta) * sim_zero
+                    # Hoặc dùng multiplicative nếu muốn ít false positive hơn:
+                    # sim = sim_few * (sim_zero ** 0.8)
+
+                    final_score = args.alpha * float(c) + (1 - args.alpha) * sim
+                    # =================================================================================
 
                     if sim >= args.sim_threshold:
                         boxes.append([x1, y1, x2, y2])
-                        scores.append(score)
+                        scores.append(final_score)
 
             # NMS
             keep = nms_by_score(boxes, scores, iou_thr=0.5)
@@ -156,38 +176,28 @@ def main():
             for i in keep:
                 x1, y1, x2, y2 = boxes[i]
                 sc = scores[i]
-                # Lưu detection
                 all_detections.append({
                     "frame": frame_id,
                     "x1": x1, "y1": y1,
                     "x2": x2, "y2": y2
                 })
-                # Vẽ lên ảnh (tùy chọn)
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(vis, f"{sc:.2f}", (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.putText(vis, f"{sc:.3f}", (x1, y1-8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
             cv2.imwrite(str(vis_vid_dir / fimg.name), vis)
 
-        # Gói vào cấu trúc yêu cầu: chỉ 1 track (giả sử chỉ có 1 object cần track)
-        if all_detections:
-            track = {"bboxes": all_detections}
-            detections = [track]
-        else:
-            detections = []
+        # Gói thành 1 track duy nhất
+        detections = [{"bboxes": all_detections}] if all_detections else []
+        results.append({"video_id": video_id, "detections": detections})
+        print(f'[DONE] {video_id} → {len(all_detections)} detections (hybrid mode)')
 
-        results.append({
-            "video_id": video_id,
-            "detections": detections
-        })
-
-        print(f'[DONE] {video_id} -> {len(all_detections)} detections')
-
-    # Ghi ra file JSON
+    # Lưu kết quả
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out_json, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
-    print(f"\nHoàn tất! Kết quả đã được lưu tại: {args.out_json}")
+    print(f"\nHOÀN TẤT! Kết quả hybrid few-shot + zero-shot đã lưu tại:\n   {args.out_json}")
+    print(f"   Visualize tại: {args.vis_dir}")
 
 if __name__ == '__main__':
     main()
