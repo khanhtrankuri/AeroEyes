@@ -50,7 +50,7 @@ python src/02_convert_annotations_to_yolo.py   --data_root ../train   --frames_d
 
 ## 3) Train YOLO
 ```bash
-python src/03_train_yolo.py --data data/yolo/dataset.yaml --epochs 5 --model yolov8n.pt
+python src/03_train_yolo.py --data data/yolo/dataset.yaml --epochs 50 --model yolov8n.pt
 ```
 Checkpoint sẽ ở `runs/detect/train*/weights/best.pt`.
 
@@ -62,7 +62,7 @@ python src/04_infer_yolo.py --weights runs/detect/train/weights/best.pt --frames
 
 ### 4b) Few-shot: 3 ảnh mẫu + YOLO proposals + CLIP similarity
 ```bash
-python src/05_infer_fewshot_clip.py   --weights runs/detect/train/weights/best.pt   --data_root ../train   --frames_dir data/frames   --out_dir outputs/fewshot   --sim_threshold 0.30
+python src/05_infer_fewshot_clip.py --weights runs/detect/train/weights/best.pt --data_root ../train --frames_dir data/frames --sim_threshold 0.30 --out_dir outputs/fewshot --slice_size 640
 ```
 - Lấy 3 ảnh mẫu trong `train/samples/{video_id}/object_images/`.
 - Tính CLIP embedding cho ảnh mẫu, so khớp với từng proposal từ YOLO trên mỗi frame -> lọc và chọn box đúng object cần tìm.

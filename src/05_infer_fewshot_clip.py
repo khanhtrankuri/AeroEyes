@@ -61,6 +61,23 @@ def nms_by_score(boxes, scores, iou_thr=0.5):
         idxs = np.delete(rest, suppress)
     return keep
 
+def get_slices(h, w, sh, sw, oh, ow):
+    slices = []
+    y = 0
+    while y < h:
+        x = 0
+        while x < w:
+            x_end = min(x + sw, w)
+            y_end = min(y + sh, h)
+            x_start = max(0, x_end - sw)
+            y_start = max(0, y_end - sh)
+            slices.append((x_start, y_start, x_end, y_end))
+            if x + sw >= w: break
+            x += (sw - ow)
+        if y + sh >= h: break
+        y += (sh - oh)
+    return slices
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--weights', type=str, required=True, help='YOLO weights (best.pt)')
@@ -71,6 +88,7 @@ def main():
     ap.add_argument('--conf', type=float, default=0.25)
     ap.add_argument('--sim_threshold', type=float, default=0.28)
     ap.add_argument('--alpha', type=float, default=0.5, help='score = alpha*det_conf + (1-alpha)*sim')
+    ap.add_argument('--slice_size', type=int, default=640, help='Size of slices for tiled inference')
     ap.add_argument('--device', type=str, default=None)
     args = ap.parse_args()
 
@@ -126,28 +144,47 @@ def main():
             if img is None:
                 continue
 
-            res = model_det.predict(img, conf=args.conf, device=args.device, verbose=False)[0]
+            # Slicing inference
+            slice_wh = (args.slice_size, args.slice_size)
+            overlap_wh = (int(args.slice_size * 0.2), int(args.slice_size * 0.2))
+            slices = get_slices(img.shape[0], img.shape[1], slice_wh[0], slice_wh[1], overlap_wh[0], overlap_wh[1])
+
             boxes, scores = [], []
 
-            if res and res.boxes is not None:
-                xyxy = res.boxes.xyxy.cpu().numpy()
-                conf = res.boxes.conf.cpu().numpy()
+            for sx1, sy1, sx2, sy2 in slices:
+                slice_img = img[sy1:sy2, sx1:sx2]
+                if slice_img.size == 0: continue
 
-                for b, c in zip(xyxy, conf):
-                    x1, y1, x2, y2 = map(int, b.tolist())
-                    crop = img[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
-                    if crop.size == 0:
-                        continue
+                res = model_det.predict(slice_img, conf=args.conf, device=args.device, verbose=False)[0]
+                
+                if res and res.boxes is not None:
+                    xyxy = res.boxes.xyxy.cpu().numpy()
+                    conf = res.boxes.conf.cpu().numpy()
 
-                    tens = img_to_tensor_bgr(crop, preprocess, device_clip)
-                    with torch.no_grad():
-                        e = normalize(model_clip.encode_image(tens))
-                    sim = float((e @ TEMPLATE_EMB.T).item())
-                    score = args.alpha * float(c) + (1 - args.alpha) * sim
+                    for b, c in zip(xyxy, conf):
+                        # Local coordinates in slice
+                        lx1, ly1, lx2, ly2 = map(int, b.tolist())
+                        
+                        # Global coordinates
+                        gx1, gy1, gx2, gy2 = lx1 + sx1, ly1 + sy1, lx2 + sx1, ly2 + sy1
+                        
+                        # Clamp to image
+                        gx1, gy1 = max(0, gx1), max(0, gy1)
+                        gx2, gy2 = min(img.shape[1], gx2), min(img.shape[0], gy2)
 
-                    if sim >= args.sim_threshold:
-                        boxes.append([x1, y1, x2, y2])
-                        scores.append(score)
+                        crop = img[gy1:gy2, gx1:gx2]
+                        if crop.size == 0:
+                            continue
+
+                        tens = img_to_tensor_bgr(crop, preprocess, device_clip)
+                        with torch.no_grad():
+                            e = normalize(model_clip.encode_image(tens))
+                        sim = float((e @ TEMPLATE_EMB.T).item())
+                        score = args.alpha * float(c) + (1 - args.alpha) * sim
+
+                        if sim >= args.sim_threshold:
+                            boxes.append([gx1, gy1, gx2, gy2])
+                            scores.append(score)
 
             # NMS
             keep = nms_by_score(boxes, scores, iou_thr=0.5)
